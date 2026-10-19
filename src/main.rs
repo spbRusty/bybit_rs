@@ -35,11 +35,26 @@ const PACE_MS: u64 = 60;
 /// Защита от бесконечного цикла (4000 страниц ≈ 7.6 лет 1m-свечей, покрывает любой листинг Bybit).
 const MAX_PAGES: usize = 4000;
 /// Сброс реалтайм-буфера в файлы, сек.
-const FLUSH_SEC: u64 = 30;
+/// ponytail: 30 → 600. append_rows переписывает весь parquet файла,
+/// поэтому 30 с давали ~87% CPU; 600 с — безопасный компромисс (канал на 1M
+/// сообщений не переполняется), а разрыв до 10 мин восстанавливается фазой 1.
+const FLUSH_SEC: u64 = 600;
 
 const L2_ROOT: &str = "data/orderbook";
 const L2_LEVELS: usize = 10;
-const L2_FLUSH_SEC: u64 = 10;
+/// L2-снимки перезаписывают часовой файл целиком. При 10 с это O(n²) и ~5 GB/день
+/// на пустом месте; 600 с снижают запись примерно на 98%.
+const L2_FLUSH_SEC: u64 = 600;
+
+/// WebSocket: одна подписка на 900+ символов (kline + orderbook.50) рвётся
+/// Bybit сразу после подписки. Шардируем символы по нескольким соединениям.
+const WS_SHARDS: usize = 6;
+/// Пауза между пакетами подписки — чтобы не превысить лимит запросов на соединение.
+const WS_SUBSCRIBE_PAUSE_MS: u64 = 100;
+/// Bybit требует клиентский ping не реже 20 с.
+const WS_PING_SEC: u64 = 20;
+/// Периодическая переподписка — подхватывает новые символы из registry.
+const WS_RESUBSCRIBE_SEC: u64 = 300;
 
 #[derive(Debug, Clone, Default)]
 struct OrderbookState {
@@ -227,21 +242,37 @@ async fn backfill_range(
             "{API}/v5/market/kline?category={}&symbol={}&interval=1&start={start}&end={cursor}&limit=1000",
             st.category, st.symbol
         );
-        // retCode=10006 (rate limit) — повторяем страницу с паузой, а не теряем её
+        // retCode=10006 (rate limit) и временные HTTP-ошибки (403/429/5xx) —
+        // повторяем страницу с экспоненциальной паузой, а не теряем файл.
         let resp = {
-            let mut attempts = 0;
+            let mut attempts = 0u32;
             loop {
-                let resp = client
-                    .get(&url)
-                    .send()
-                    .await
-                    .with_context(|| format!("GET {url}"))?
-                    .error_for_status()?
-                    .json::<Value>()
-                    .await?;
+                let resp = match client.get(&url).send().await {
+                    Ok(r)
+                        if (r.status() == reqwest::StatusCode::FORBIDDEN
+                            || r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS
+                            || r.status().is_server_error())
+                            && attempts < 5 =>
+                    {
+                        attempts += 1;
+                        let delay = 2u64.pow(attempts.min(5));
+                        eprintln!("[{}] HTTP {} — повтор через {delay}с", st.symbol, r.status());
+                        sleep(Duration::from_secs(delay)).await;
+                        continue;
+                    }
+                    Ok(r) => r.error_for_status()?.json::<Value>().await?,
+                    Err(e) if attempts < 5 => {
+                        attempts += 1;
+                        let delay = 2u64.pow(attempts.min(5));
+                        eprintln!("[{}] сеть: {e} — повтор через {delay}с", st.symbol);
+                        sleep(Duration::from_secs(delay)).await;
+                        continue;
+                    }
+                    Err(e) => return Err(e).with_context(|| format!("GET {url}")),
+                };
                 if resp["retCode"].as_i64() == Some(10006) && attempts < 10 {
                     attempts += 1;
-                    sleep(Duration::from_millis(2000 * attempts)).await;
+                    sleep(Duration::from_millis(2000 * u64::from(attempts))).await;
                     continue;
                 }
                 break resp;
@@ -296,7 +327,12 @@ async fn repair_one(
     tokens: Arc<Mutex<mpsc::Receiver<()>>>,
 ) -> Result<Vec<Candle>> {
     let now = Utc::now().timestamp_millis();
-    let candles = if st.path.exists() { read_parquet(&st.path)? } else { vec![] };
+    let candles = if st.path.exists() {
+        let path = st.path.clone();
+        tokio::task::spawn_blocking(move || read_parquet(&path)).await??
+    } else {
+        vec![]
+    };
     if candles.is_empty() {
         // файла нет — качаем от листинга (или последних 2 дней, если листинг неизвестен)
         let start = listed.unwrap_or_else(|| now - 2 * 86_400_000);
@@ -430,10 +466,17 @@ async fn refresh_loop(
                 };
                 match res {
                     Ok(rows) => {
-                        if let Err(e) = append_rows(&st.path, &rows) {
+                        let rows_len = rows.len();
+                        let path = st.path.clone();
+                        let write_res = tokio::task::spawn_blocking(move || append_rows(&path, &rows)).await;
+                        let write_res = match write_res {
+                            Ok(r) => r,
+                            Err(e) => Err(anyhow::anyhow!("join append: {e}")),
+                        };
+                        if let Err(e) = write_res {
                             eprintln!("[refresh {}] запись: {e:#}", st.symbol);
-                        } else if !rows.is_empty() {
-                            println!("[refresh {}] новая пара, +{} свечек ({})", st.symbol, rows.len(), st.category);
+                        } else if rows_len > 0 {
+                            println!("[refresh {}] новая пара, +{rows_len} свечек ({})", st.symbol, st.category);
                             added.push(st.symbol.clone());
                         }
                     }
@@ -452,12 +495,19 @@ async fn refresh_loop(
     }
 }
 
-async fn ws_loop(category: &str, registry: Arc<RwLock<HashMap<String, Vec<String>>>>, tx: mpsc::Sender<(String, Vec<Candle>)>, l2_tx: mpsc::Sender<OrderbookUpdate>) {
+async fn ws_loop(
+    category: &str,
+    shard: usize,
+    shards: usize,
+    registry: Arc<RwLock<HashMap<String, Vec<String>>>>,
+    tx: mpsc::Sender<(String, Vec<Candle>)>,
+    l2_tx: mpsc::Sender<OrderbookUpdate>,
+) {
     loop {
         let url = format!("wss://stream.bybit.com/v5/public/{category}");
-        match ws_run(&url, category, &registry, &tx, &l2_tx).await {
+        match ws_run(&url, category, shard, shards, &registry, &tx, &l2_tx).await {
             Ok(_) => {}
-            Err(e) => eprintln!("[ws {category}] {e:#}; переподключение через 3с"),
+            Err(e) => eprintln!("[ws {category} shard {shard}/{shards}] {e:#}; переподключение через 3с"),
         }
         sleep(Duration::from_secs(3)).await;
     }
@@ -466,22 +516,41 @@ async fn ws_loop(category: &str, registry: Arc<RwLock<HashMap<String, Vec<String
 async fn ws_run(
     url: &str,
     category: &str,
+    shard: usize,
+    shards: usize,
     registry: &Arc<RwLock<HashMap<String, Vec<String>>>>,
     tx: &mpsc::Sender<(String, Vec<Candle>)>,
     l2_tx: &mpsc::Sender<OrderbookUpdate>,
 ) -> Result<()> {
     let (ws, _) = tokio_tungstenite::connect_async(url).await?;
     let (mut sink, mut stream) = ws.split();
-    subscribe_all(&mut sink, registry, category).await?;
-    eprintln!("[ws] {url} подписан: {} символов", registry.read().await.get(category).map(|v| v.len()).unwrap_or(0));
+    subscribe_all(&mut sink, registry, category, shard, shards).await?;
+    let subscribed = registry
+        .read().await
+        .get(category)
+        .map(|v| v.iter().enumerate().filter(|(i, _)| i % shards == shard).count())
+        .unwrap_or(0);
+    eprintln!("[ws] {url} shard {shard}/{shards} подписан: {subscribed} символов");
+
+    let mut ping = tokio::time::interval(Duration::from_secs(WS_PING_SEC));
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ping.tick().await; // первый тик interval срабатывает сразу — пропускаем
+    let mut resub = tokio::time::interval(Duration::from_secs(WS_RESUBSCRIBE_SEC));
+    resub.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    resub.tick().await;
+
     loop {
         let msg = tokio::select! {
             msg = stream.next() => match msg {
                 Some(m) => m?,
                 None => break,
             },
-            _ = sleep(Duration::from_secs(60)) => {
-                subscribe_all(&mut sink, registry, category).await?;
+            _ = ping.tick() => {
+                sink.send(Message::Text(json!({"op": "ping"}).to_string().into())).await?;
+                continue;
+            }
+            _ = resub.tick() => {
+                subscribe_all(&mut sink, registry, category, shard, shards).await?;
                 continue;
             }
         };
@@ -536,21 +605,40 @@ async fn ws_run(
     Ok(())
 }
 
-/// Подписка на kline.1.* по всем символам категории из registry. Bybit идемпотентен:
-/// повторная отправка subscribe — не ошибка, поэтому ресабскриб каждые 60с безопасен.
-async fn subscribe_all<S>(sink: &mut S, registry: &Arc<RwLock<HashMap<String, Vec<String>>>>, category: &str) -> Result<()>
+/// Подписка на kline.1.* и orderbook.50.* для своего шарда символов.
+/// Bybit идемпотентен: повторная отправка subscribe — не ошибка, поэтому
+/// периодическая переподписка безопасна и подхватывает новые символы из registry.
+async fn subscribe_all<S>(
+    sink: &mut S,
+    registry: &Arc<RwLock<HashMap<String, Vec<String>>>>,
+    category: &str,
+    shard: usize,
+    shards: usize,
+) -> Result<()>
 where
     S: Sink<Message> + Unpin,
     S::Error: std::error::Error + Send + Sync + 'static,
 {
-    let syms = registry.read().await.get(category).cloned().unwrap_or_default();
+    let syms: Vec<String> = registry
+        .read().await
+        .get(category)
+        .map(|v| {
+            v.iter()
+                .enumerate()
+                .filter(|(i, _)| i % shards == shard)
+                .map(|(_, s)| s.clone())
+                .collect()
+        })
+        .unwrap_or_default();
     for chunk in syms.chunks(10) {
         let args: Vec<String> = chunk.iter().map(|s| format!("kline.1.{s}")).collect();
         sink.send(Message::Text(json!({"op": "subscribe", "args": args}).to_string().into())).await?;
+        sleep(Duration::from_millis(WS_SUBSCRIBE_PAUSE_MS)).await;
     }
     for chunk in syms.chunks(10) {
         let args: Vec<String> = chunk.iter().map(|s| format!("orderbook.50.{s}")).collect();
         sink.send(Message::Text(json!({"op": "subscribe", "args": args}).to_string().into())).await?;
+        sleep(Duration::from_millis(WS_SUBSCRIBE_PAUSE_MS)).await;
     }
     Ok(())
 }
@@ -586,8 +674,11 @@ async fn flush_loop(mut rx: mpsc::Receiver<(String, Vec<Candle>)>) {
             let rows = pending.remove(&key).unwrap_or_default();
             let (cat, sym) = key.split_once('/').expect("key cat/sym");
             let path = Path::new(ROOT).join(cat).join(format!("{sym}_{cat}_1m.parquet"));
-            if let Err(e) = append_rows(&path, &rows) {
-                eprintln!("[flush {sym}] {e:#}");
+            let write_res = tokio::task::spawn_blocking(move || append_rows(&path, &rows)).await;
+            match write_res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("[flush {sym}] {e:#}"),
+                Err(e) => eprintln!("[flush {sym}] join: {e}"),
             }
         }
         eprintln!("[flush] записано свечей: {total}");
@@ -841,10 +932,17 @@ async fn main() -> Result<()> {
             let (st, res, done) = joined?;
             match res {
                 Ok(rows) => {
-                    if let Err(e) = append_rows(&st.path, &rows) {
+                    let rows_len = rows.len();
+                    let path = st.path.clone();
+                    let write_res = tokio::task::spawn_blocking(move || append_rows(&path, &rows)).await;
+                    let write_res = match write_res {
+                        Ok(r) => r,
+                        Err(e) => Err(anyhow::anyhow!("join append: {e}")),
+                    };
+                    if let Err(e) = write_res {
                         eprintln!("[{}] запись: {e:#}", st.symbol);
                         failed += 1;
-                    } else if !rows.is_empty() {
+                    } else if rows_len > 0 {
                         let d = done.fetch_add(1, Ordering::SeqCst) + 1;
                         if d % 50 == 0 || d == 1 {
                             println!("{label}: {d}/{total}...");
@@ -863,13 +961,20 @@ async fn main() -> Result<()> {
     println!("ремонт завершён (худший проход: {worst} неудач). Переключаюсь в реалтайм.");
 
     // Фаза 2: реалтайм.
-    let (wtx, wrx) = mpsc::channel(8192);
+    // ponytail: 8192 → 1M. append_rows синхронный (~186 с), rx.recv() в это время не
+    // вызывается, поэтому 8192 переполнялось за ~15 с при 533 свечи/с: wtx.send() блокировал
+    // ws_run, пинги не отвечались, Bybit рвал соединение каждые ~3 с (32501 переподключение).
+    // 1M покрывает пик ~99k свечей за цикл с запасом. Апгрейд: инкрементальная дозапись
+    // вместо перезаписи всего файла, тогда ёмкость можно вернуть.
+    let (wtx, wrx) = mpsc::channel(1_000_000);
     let (l2_tx, l2_rx) = mpsc::channel(8192);
     for cat in ["linear", "spot"] {
-        let wtx = wtx.clone();
-        let l2_tx = l2_tx.clone();
-        let registry = registry.clone();
-        tokio::spawn(async move { ws_loop(cat, registry, wtx, l2_tx).await });
+        for shard in 0..WS_SHARDS {
+            let wtx = wtx.clone();
+            let l2_tx = l2_tx.clone();
+            let registry = registry.clone();
+            tokio::spawn(async move { ws_loop(cat, shard, WS_SHARDS, registry, wtx, l2_tx).await });
+        }
     }
     drop(wtx);
     drop(l2_tx);
